@@ -737,7 +737,10 @@ class DockerCommandRunner(CommandRunnerInterface):
         return string
 
     def _check_if_container_restart_is_needed(
-        self, image: str, cleaned_bind_mounts: Dict[str, str]
+        self,
+        image: str,
+        cleaned_bind_mounts: Dict[str, str],
+        copied_mounts: Optional[List[str]] = None,
     ) -> bool:
         re_init_required = False
         running_image = (
@@ -785,6 +788,20 @@ class DockerCommandRunner(CommandRunnerInterface):
                     "this node to pick up the following file_mounts {}",
                     unfulfilled_mounts,
                 )
+            # A container from an earlier `ray up` can bind mount a file that
+            # is now copied in, and a bind-mounted file can't be replaced.
+            bind_mounted_copies = {
+                self._docker_expand_user(remote).strip("/")
+                for remote in copied_mounts or []
+            } & active_remote_mounts
+            if bind_mounted_copies:
+                re_init_required = True
+                cli_logger.warning(
+                    "This Docker Container is already running. "
+                    "Restarting the Docker container on this node to copy in "
+                    "the following files instead of bind mounting them {}",
+                    bind_mounted_copies,
+                )
         except json.JSONDecodeError:
             cli_logger.verbose(
                 "Unable to check if file_mounts specified in the YAML "
@@ -796,6 +813,11 @@ class DockerCommandRunner(CommandRunnerInterface):
         self, *, as_head: bool, file_mounts: Dict[str, str], sync_run_yet: bool
     ):
         BOOTSTRAP_MOUNTS = ["~/ray_bootstrap_config.yaml", "~/ray_bootstrap_key.pem"]
+        # Files copied into the container instead of bind mounted. A bind
+        # mount shows the host file's owner, the host's SSH user, who can have
+        # another UID than the container user. A copy made in the container
+        # belongs to the container user. The owner-only auth token needs that.
+        copied_mounts = BOOTSTRAP_MOUNTS + [AUTH_TOKEN_REMOTE_PATH]
 
         specific_image = self.docker_config.get(
             f"{'head' if as_head else 'worker'}_image", self.docker_config.get("image")
@@ -819,7 +841,7 @@ class DockerCommandRunner(CommandRunnerInterface):
         # Bootstrap files cannot be bind mounted because docker opens the
         # underlying inode. When the file is switched, docker becomes outdated.
         cleaned_bind_mounts = file_mounts.copy()
-        for mnt in BOOTSTRAP_MOUNTS:
+        for mnt in copied_mounts:
             cleaned_bind_mounts.pop(mnt, None)
 
         docker_run_executed = False
@@ -828,7 +850,9 @@ class DockerCommandRunner(CommandRunnerInterface):
         requires_re_init = False
         if container_running:
             requires_re_init = self._check_if_container_restart_is_needed(
-                specific_image, cleaned_bind_mounts
+                specific_image,
+                cleaned_bind_mounts,
+                copied_mounts=[m for m in copied_mounts if m in file_mounts],
             )
             if requires_re_init:
                 docker_stop_cmd = f"{self.docker_cmd} stop {self.container_name}"
@@ -886,14 +910,18 @@ class DockerCommandRunner(CommandRunnerInterface):
             self.run(start_command, run_env="host")
             docker_run_executed = True
 
-        # Explicitly copy in ray bootstrap files.
-        for mount in BOOTSTRAP_MOUNTS:
+        # Explicitly copy in ray bootstrap files and the auth token.
+        for mount in copied_mounts:
             if mount in file_mounts:
                 if not sync_run_yet:
                     # NOTE(ilr) This rsync is needed because when starting from
                     #  a stopped instance,  /tmp may be deleted and `run_init`
                     # is called before the first `file_sync` happens
                     self.run_rsync_up(file_mounts[mount], mount)
+                parent = os.path.dirname(mount)
+                if parent != "~":
+                    # rsync doesn't create the parent, such as ~/.ray.
+                    self.run(f"mkdir -p {parent}")
                 self.ssh_command_runner.run(
                     "rsync -e '{cmd} exec -i' -avz {src} {container}:{dst}".format(
                         cmd=self.docker_cmd,
@@ -940,30 +968,8 @@ class DockerCommandRunner(CommandRunnerInterface):
                         f"command like 'chown {current_user} {mount}' to "
                         "your `setup_commands`."
                     )
-        if AUTH_TOKEN_REMOTE_PATH in file_mounts:
-            self._make_auth_token_readable()
         self.initialized = True
         return docker_run_executed
-
-    def _make_auth_token_readable(self) -> None:
-        """Give the container user the owner-only auth token file.
-
-        The token is bind mounted with the owner and mode it has on the host,
-        and the host's SSH user can have a different UID than the container
-        user, who then can't read it.
-        """
-        path = AUTH_TOKEN_REMOTE_PATH
-        try:
-            self.run(f"test -r {path} || sudo chown $(id -u):$(id -g) {path}")
-        except Exception:
-            cli_logger.warning(
-                "The container user can't read the auth token file {} and "
-                "couldn't take ownership of it with `sudo chown`, so Ray on "
-                "this node can't authenticate. Install `sudo` in the image, or "
-                "run the container as a user whose UID matches the SSH user's "
-                "on the host.",
-                path,
-            )
 
     def _configure_runtime(self, run_options: List[str]) -> List[str]:
         if self.docker_config.get("disable_automatic_runtime_detection"):

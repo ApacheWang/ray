@@ -470,7 +470,33 @@ def script_running_container_without_token_mount(runner: MockProcessRunner):
     runner.respond_to_call(".State.Running", ["true"] * 10)
 
 
-def test_docker_mode_mounts_token_and_restarts_container(clean_auth_env, monkeypatch):
+def script_running_container_with_token_mount(runner: MockProcessRunner):
+    # A container from an earlier `ray up`, which bind mounted the token. The
+    # mock runner answers the container's HOME with "command-output".
+    runner.respond_to_call(
+        "json .Mounts", ['[{"Destination": "/command-output/.ray/auth_token"}]']
+    )
+    runner.respond_to_call("json .Config.Env", ["[]"])
+    runner.respond_to_call(".State.Running", ["true"] * 10)
+
+
+def commands_run_by(result: RayUpResult) -> List[str]:
+    return [" ".join(map(str, c)) for c in result.runner.calls]
+
+
+def copies_token_into_container(command: str) -> bool:
+    # rsync run through `docker exec` into the container named "mock".
+    return (
+        re.search(
+            r"rsync -e \S*docker exec -i\S* -avz \S*/\.ray/auth_token "
+            r"mock:\S*/\.ray/auth_token",
+            command,
+        )
+        is not None
+    )
+
+
+def test_docker_mode_copies_token_into_running_container(clean_auth_env, monkeypatch):
     monkeypatch.setenv("RAY_AUTH_TOKEN", "env-token")
 
     result = ray_up(
@@ -479,17 +505,32 @@ def test_docker_mode_mounts_token_and_restarts_container(clean_auth_env, monkeyp
 
     [(_, content, mode)] = result.token_uploads
     assert (content, mode) == ("env-token", 0o600)
-    commands_run = [" ".join(map(str, c)) for c in result.runner.calls]
+    commands_run = commands_run_by(result)
     assert any(
         re.search(r"rsync .*/tmp/ray_tmp_mount/default/~/\.ray/auth_token$", c)
         for c in commands_run
     )
-    result.runner.assert_has_call("1.2.3.4", pattern="docker stop")
-    result.runner.assert_has_call(
-        "1.2.3.4",
-        pattern=r"docker run.*-v /tmp/ray_tmp_mount/default/~/\.ray/auth_token:"
-        r"/root/\.ray/auth_token",
+    # A copy made in the container belongs to the container user, so the
+    # container needs no token mount and no restart.
+    assert any(copies_token_into_container(c) for c in commands_run), commands_run
+    assert not any("docker stop" in c for c in commands_run)
+
+
+def test_docker_mode_restarts_container_that_bind_mounts_token(
+    clean_auth_env, monkeypatch
+):
+    monkeypatch.setenv("RAY_AUTH_TOKEN", "env-token")
+
+    result = ray_up(
+        DOCKER_CONFIG, script_runner=script_running_container_with_token_mount
     )
+
+    # A bind-mounted file can't be replaced by the copy.
+    result.runner.assert_has_call("1.2.3.4", pattern="docker stop")
+    commands_run = commands_run_by(result)
+    [docker_run] = [c for c in commands_run if "docker run" in c]
+    assert "auth_token" not in docker_run
+    assert any(copies_token_into_container(c) for c in commands_run), commands_run
 
 
 def script_new_container(runner: MockProcessRunner):
@@ -499,25 +540,28 @@ def script_new_container(runner: MockProcessRunner):
 
 
 @pytest.mark.parametrize("auth_mode", ["token", "disabled"])
-def test_docker_container_user_takes_unreadable_token(clean_auth_env, auth_mode):
+def test_docker_mode_copies_token_into_new_container(clean_auth_env, auth_mode):
     config = copy.deepcopy(DOCKER_CONFIG)
     config["auth_mode"] = auth_mode
 
     result = ray_up(config, script_runner=script_new_container)
 
-    # The bind-mounted token keeps the host user's UID, which the container
-    # user may not have.
-    chowns = [
-        " ".join(map(str, c))
-        for c in result.runner.calls
-        if re.search(
-            r"test -r \S*/\.ray/auth_token \|\| sudo chown", " ".join(map(str, c))
-        )
-    ]
+    commands_run = commands_run_by(result)
+    [docker_run] = [c for c in commands_run if "docker run" in c]
+    # The token is never bind mounted, because a bind mount shows the host
+    # user's UID, which the container user may not have.
+    assert "auth_token" not in docker_run
+    copies = [c for c in commands_run if copies_token_into_container(c)]
     if auth_mode == "token":
-        assert len(chowns) == 1 and "docker exec" in chowns[0], chowns
+        assert len(copies) == 1, commands_run
+        # After the container starts, into a ~/.ray that exists.
+        assert commands_run.index(docker_run) < commands_run.index(copies[0])
+        assert any(
+            "docker exec" in c and re.search(r"mkdir -p \S*/\.ray\b", c)
+            for c in commands_run
+        )
     else:
-        assert chowns == []
+        assert copies == []
 
 
 def test_fake_docker_runner_skips_only_token_upload(clean_auth_env, monkeypatch):
