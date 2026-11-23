@@ -295,6 +295,9 @@ def _running_test_script(
 ) -> None:
     command = test["run"]["script"]
     command_env = test.get_byod_runtime_env()
+    # The image the job runs on, built from the commit under test. Tests that
+    # launch their own clusters, like the cluster launcher tests, run it there.
+    command_env["RELEASE_TEST_IMAGE"] = test.get_anyscale_byod_image()
 
     if smoke_test:
         command = f"{command} --smoke-test"

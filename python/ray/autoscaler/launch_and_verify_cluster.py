@@ -10,6 +10,8 @@ Usage:
         <cluster_configuration_file_path>
 """
 import argparse
+import base64
+import glob
 import json
 import os
 import re
@@ -19,6 +21,7 @@ import tempfile
 import time
 import traceback
 from pathlib import Path
+from typing import Optional
 
 import boto3
 import botocore
@@ -27,6 +30,14 @@ from google.cloud import storage
 
 import ray
 from ray.autoscaler._private.aws.config import RAY
+from ray.autoscaler._private.util import fillout_defaults
+from ray.autoscaler.sdk import get_docker_host_mount_location
+
+# Where the registry login for the nodes' image goes on each node, inside the
+# per-cluster directory that `ray up` syncs file mounts to on the host.
+REMOTE_DOCKER_CONFIG = "/tmp/release_test_docker/config.json"
+# Where this job's Ray wheel goes on each node.
+REMOTE_WHEEL_DIR = "~/release_test_ray_wheel"
 
 
 def check_arguments():
@@ -54,15 +65,22 @@ def check_arguments():
     )
     parser.add_argument(
         "--docker-override",
-        choices=["disable", "latest", "nightly", "commit"],
+        choices=["disable", "nightly", "commit"],
         default="disable",
-        help="Override the docker image used for the head node and worker nodes",
+        help=(
+            "Override the docker image used for the head node and worker nodes. "
+            "`commit` uses the image this release test runs on, which holds the "
+            "Ray under test."
+        ),
     )
     parser.add_argument(
         "--wheel-override",
         type=str,
         default="",
-        help="Override the wheel used for the head node and worker nodes",
+        help=(
+            "Override the wheel used for the head node and worker nodes: a URL, "
+            "or `commit` for the Ray wheel this release test runs."
+        ),
     )
     parser.add_argument(
         "cluster_config", type=str, help="Path to the cluster configuration file"
@@ -93,19 +111,18 @@ def get_docker_image(docker_override: str):
         The docker image to use for the head node and worker nodes, or None if not
         applicable.
     """
-    if docker_override == "latest":
-        return "rayproject/ray:latest-py310"
-    elif docker_override == "nightly":
+    if docker_override == "nightly":
         return "rayproject/ray:nightly-py310"
     elif docker_override == "commit":
-        if re.match("^[0-9]+.[0-9]+.[0-9]+$", ray.__version__):
-            return f"rayproject/ray:{ray.__version__}.{ray.__commit__[:6]}-py310"
-        else:
+        # The release test harness sets this to the image the test runs on.
+        image = os.environ.get("RELEASE_TEST_IMAGE")
+        if not image:
             print(
-                "Error: docker image is only available for "
-                f"release version, but we get: {ray.__version__}"
+                "Error: --docker-override commit needs RELEASE_TEST_IMAGE, which "
+                "the release test harness sets to the image under test."
             )
             sys.exit(1)
+        return image
     return None
 
 
@@ -129,6 +146,109 @@ def override_wheels_url(config_yaml, wheel_url):
         f'pip3 uninstall -y ray && pip3 install -U "ray[default] @ {wheel_url}"'
     )
     config_yaml["setup_commands"] = setup_commands
+
+
+def find_local_ray_wheel() -> str:
+    """Return the path of the wheel this job's Ray was installed from.
+
+    The release test images keep the wheel they install in the home directory.
+
+    Returns:
+        The path of the wheel.
+
+    Raises:
+        SystemExit: No wheel of this job's Ray version is there.
+    """
+    pattern = os.path.expanduser(f"~/ray-{ray.__version__}-*.whl")
+    wheels = glob.glob(pattern)
+    if len(wheels) != 1:
+        print(f"Error: expected one Ray wheel matching {pattern}, found {wheels}")
+        sys.exit(1)
+    return wheels[0]
+
+
+def override_wheel_with_local(config_yaml: dict, wheel_path: str) -> None:
+    """Install the given local Ray wheel on every node.
+
+    The provider's default setup commands install the latest nightly wheel
+    when a node has no Ray, so this fills in the defaults and replaces that
+    step with installing the given wheel.
+    """
+    wheel_name = os.path.basename(wheel_path)
+    remote_wheel = f"{REMOTE_WHEEL_DIR}/{wheel_name}"
+    filled_config = fillout_defaults(config_yaml)
+    setup_commands = [
+        cmd
+        for cmd in filled_config.get("setup_commands", [])
+        if not cmd.startswith("which ray ||")
+    ]
+    setup_commands.append(
+        "pip3 uninstall -y ray; "
+        f'pip3 install -U "$HOME/{remote_wheel[len("~/"):]}[default]"'
+    )
+    config_yaml["setup_commands"] = setup_commands
+    config_yaml.setdefault("file_mounts", {})[remote_wheel] = wheel_path
+
+
+def get_registry_auth(registry: str) -> Optional[str]:
+    """Return a short-lived Docker `auth` value for pulling from `registry`
+    with this job's cloud credentials, or None for a public registry.
+
+    Args:
+        registry: The registry host, like `123.dkr.ecr.us-west-2.amazonaws.com`.
+
+    Returns:
+        The base64 of `user:password` for the registry, or None if this job
+        has no way to log in to it.
+    """
+    ecr = re.fullmatch(r"(\d+)\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com", registry)
+    if ecr:
+        registry_id, region = ecr.groups()
+        response = boto3.client("ecr", region_name=region).get_authorization_token(
+            registryIds=[registry_id]
+        )
+        # Already base64 of "AWS:<password>".
+        return response["authorizationData"][0]["authorizationToken"]
+    if registry.endswith("-docker.pkg.dev"):
+        import google.auth
+        import google.auth.transport.requests
+
+        credentials, _ = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        credentials.refresh(google.auth.transport.requests.Request())
+        return base64.b64encode(
+            f"oauth2accesstoken:{credentials.token}".encode()
+        ).decode()
+    return None
+
+
+def add_registry_login(config_yaml: dict, docker_image: str, tmp_dir: str) -> None:
+    """Let every node pull `docker_image` from its private registry.
+
+    Writes a Docker config holding a short-lived login for the registry to an
+    owner-only file, ships it to each node's host as a file mount, and copies
+    it to the SSH user's Docker config in an initialization command, which
+    runs before `ray up` pulls the image. The login never appears on a
+    command line or in the output.
+    """
+    registry = docker_image.split("/")[0]
+    auth = get_registry_auth(registry) if "." in registry else None
+    if auth is None:
+        return
+    print(f"Logging the nodes in to {registry} to pull the image.")
+    local_config = os.path.join(tmp_dir, "docker_config.json")
+    fd = os.open(local_config, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump({"auths": {registry: {"auth": auth}}}, f)
+    config_yaml.setdefault("file_mounts", {})[REMOTE_DOCKER_CONFIG] = local_config
+    host_config = (
+        get_docker_host_mount_location(config_yaml["cluster_name"])
+        + REMOTE_DOCKER_CONFIG
+    )
+    config_yaml["initialization_commands"] = list(
+        config_yaml.get("initialization_commands") or []
+    ) + ["mkdir -p ~/.docker && " f"install -m 600 {host_config} ~/.docker/config.json"]
 
 
 def override_docker_image(config_yaml, docker_image):
@@ -472,9 +592,17 @@ if __name__ == "__main__":
         config_yaml["cluster_name"] + "-" + str(int(time.time()))
     )
 
+    # Holds files shipped to the nodes, like the registry login, until the
+    # script exits.
+    files_dir = tempfile.TemporaryDirectory()
+
     print("======================================")
     print(f"Overriding ray wheel...: {wheel_override}")
-    if wheel_override:
+    if wheel_override == "commit":
+        wheel_path = find_local_ray_wheel()
+        print(f"Using this job's Ray wheel: {wheel_path}")
+        override_wheel_with_local(config_yaml, wheel_path)
+    elif wheel_override:
         override_wheels_url(config_yaml, wheel_override)
 
     print("======================================")
@@ -483,6 +611,7 @@ if __name__ == "__main__":
     print(f"Using docker image: {docker_override_image}")
     if docker_override_image:
         override_docker_image(config_yaml, docker_override_image)
+        add_registry_login(config_yaml, docker_override_image, files_dir.name)
 
     provider_type = config_yaml.get("provider", {}).get("type")
     config_yaml["provider"]["cache_stopped_nodes"] = False
