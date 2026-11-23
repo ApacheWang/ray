@@ -492,6 +492,34 @@ def test_docker_mode_mounts_token_and_restarts_container(clean_auth_env, monkeyp
     )
 
 
+def script_new_container(runner: MockProcessRunner):
+    runner.respond_to_call("json .Mounts", ["[]"])
+    runner.respond_to_call("json .Config.Env", ["[]"])
+    runner.respond_to_call(".State.Running", ["false"] * 4)
+
+
+@pytest.mark.parametrize("auth_mode", ["token", "disabled"])
+def test_docker_container_user_takes_unreadable_token(clean_auth_env, auth_mode):
+    config = copy.deepcopy(DOCKER_CONFIG)
+    config["auth_mode"] = auth_mode
+
+    result = ray_up(config, script_runner=script_new_container)
+
+    # The bind-mounted token keeps the host user's UID, which the container
+    # user may not have.
+    chowns = [
+        " ".join(map(str, c))
+        for c in result.runner.calls
+        if re.search(
+            r"test -r \S*/\.ray/auth_token \|\| sudo chown", " ".join(map(str, c))
+        )
+    ]
+    if auth_mode == "token":
+        assert len(chowns) == 1 and "docker exec" in chowns[0], chowns
+    else:
+        assert chowns == []
+
+
 def test_fake_docker_runner_skips_only_token_upload(clean_auth_env, monkeypatch):
     monkeypatch.setenv("RAY_FAKE_CLUSTER", "1")
     runner = FakeDockerCommandRunner(
