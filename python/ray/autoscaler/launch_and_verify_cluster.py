@@ -242,6 +242,11 @@ def add_registry_login(config_yaml: dict, docker_image: str, tmp_dir: str) -> No
     with os.fdopen(fd, "w") as f:
         json.dump({"auths": {registry: {"auth": auth}}}, f)
     config_yaml.setdefault("file_mounts", {})[REMOTE_DOCKER_CONFIG] = local_config
+    # The file keeps the host user's UID in the container, whose user can have
+    # another UID, and the head's autoscaler reads every file mount.
+    config_yaml["setup_commands"] = [
+        f'sudo chown "$(id -u):$(id -g)" {REMOTE_DOCKER_CONFIG}'
+    ] + list(fillout_defaults(config_yaml).get("setup_commands") or [])
     host_config = (
         get_docker_host_mount_location(config_yaml["cluster_name"])
         + REMOTE_DOCKER_CONFIG
@@ -483,6 +488,28 @@ def cleanup_security_groups(config):
         print(f"Error cleaning up security groups: {e}")
 
 
+def get_autoscaler_logs(cluster_config: Path, no_config_cache: bool, env: dict) -> str:
+    """Return the errors and the last lines of the autoscaler logs on the head.
+
+    They include the setup output of the worker nodes, which the autoscaler
+    launches.
+    """
+    logs = "/tmp/ray/session_latest/logs/monitor*"
+    cmd = [
+        "ray",
+        "exec",
+        str(cluster_config),
+        f"grep -hiE 'error|fail|denied|unauthorized|no space' {logs} | tail -n 30; "
+        f"echo ...; tail -n 30 {logs}",
+    ]
+    if no_config_cache:
+        cmd.append("--no-config-cache")
+    result = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env
+    )
+    return result.stdout.decode("utf-8", errors="replace")
+
+
 def run_ray_commands(
     config_yaml: dict,
     cluster_config: Path,
@@ -555,7 +582,13 @@ def run_ray_commands(
             f"Error: Verification failed after {retries} attempts. Cleaning up cluster "
             "before exiting..."
         )
+        autoscaler_logs = get_autoscaler_logs(cluster_config, no_config_cache, env)
         cleanup_cluster(config_yaml, cluster_config)
+        # Printed last, because the release test harness keeps only the end of
+        # the output.
+        print("======================================")
+        print("Autoscaler logs on the head node, which show how workers were set up:")
+        print(autoscaler_logs)
         print("======================================")
         print("Exiting script.")
         sys.exit(1)
