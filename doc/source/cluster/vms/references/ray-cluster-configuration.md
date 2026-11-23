@@ -718,7 +718,7 @@ The default Docker image to pull in the head and worker nodes. This can be overr
 * **Importance:** High
 * **Type:** String
 
-The Ray project publishes Docker images to the `rayproject/ray` [Docker Hub repository](https://hub.docker.com/r/rayproject/ray). Pin an explicit Ray version rather than a floating tag such as `latest`, so that the image your cluster starts doesn't change underneath you when a new Ray release ships:
+The Ray project publishes Docker images to the `rayproject/ray` [Docker Hub repository](https://hub.docker.com/r/rayproject/ray). Pin the Ray version you have installed rather than a floating tag such as `latest`. `ray up` fails if the head node runs a different Ray version than the machine you run it on, and a pinned image doesn't change underneath you when a new Ray release ships:
 
 * `rayproject/ray:2.56.1`: No CUDA support.
 * `rayproject/ray:2.56.1-gpu`: CUDA support.

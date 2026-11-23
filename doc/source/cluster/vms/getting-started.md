@@ -272,6 +272,8 @@ After defining our configuration, we will use the Ray cluster launcher to start 
 $ ray up -y config.yaml
 ```
 
+The nodes must run the same Ray version as the machine you run `ray up` on. Before `ray up` starts Ray on the head node, it compares the head node's Ray version with its own and fails if they differ. If the cluster YAML sets a Docker image, use the image of the Ray version you have installed.
+
 (vm-cluster-token-auth)=
 
 ### Token authentication with the cluster launcher

@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import subprocess
 import time
 import traceback
@@ -71,6 +72,8 @@ class NodeUpdater:
             metric tracking.
         auth_mode: The cluster YAML's `auth_mode`. When given, the start
             commands run with RAY_AUTH_MODE set to it.
+        expected_ray_version: When given, the node's Ray version must equal
+            it, or the update fails before the start commands run.
     """
 
     def __init__(
@@ -97,6 +100,7 @@ class NodeUpdater:
         restart_only: bool = False,
         for_recovery: bool = False,
         auth_mode: Optional[str] = None,
+        expected_ray_version: Optional[str] = None,
     ):
         self.log_prefix = "NodeUpdater: {}: ".format(node_id)
         # Three cases:
@@ -155,6 +159,7 @@ class NodeUpdater:
         self.is_head_node = is_head_node
         self.docker_config = docker_config
         self.restart_only = restart_only
+        self.expected_ray_version = expected_ray_version
         self.update_time = None
         self.for_recovery = for_recovery
 
@@ -514,6 +519,9 @@ class NodeUpdater:
                         _numbered=("[]", 6, NUM_SETUP_STEPS),
                     )
 
+        if self.expected_ray_version:
+            self._check_ray_version()
+
         with cli_logger.group(
             "Starting the Ray runtime", _numbered=("[]", 7, NUM_SETUP_STEPS)
         ):
@@ -554,6 +562,41 @@ class NodeUpdater:
                         raise click.ClickException("Start command failed.")
             global_event_system.execute_callback(
                 CreateClusterEvent.start_ray_runtime_completed
+            )
+
+    def _check_ray_version(self) -> None:
+        """Fail the update if the node runs another Ray version than expected.
+
+        Runs after the setup commands, which can install Ray, and before the
+        start commands, in the same environment as the start commands.
+
+        Raises:
+            click.ClickException: The node's Ray version differs from
+                `expected_ray_version`.
+        """
+        try:
+            output = self.cmd_runner.run(
+                "ray --version", with_output=True, run_env="auto"
+            )
+        except ProcessRunnerError:
+            output = b""
+        match = re.search(r"ray, version (\S+)", output.decode(errors="replace"))
+        if not match:
+            cli_logger.warning(
+                "Couldn't determine the Ray version on the node from "
+                "`ray --version`, so it isn't checked against this Ray {}.",
+                self.expected_ray_version,
+            )
+            return
+        node_ray_version = match.group(1)
+        if node_ray_version != self.expected_ray_version:
+            raise click.ClickException(
+                f"Ray version mismatch: this command runs Ray "
+                f"{self.expected_ray_version}, but the node runs Ray "
+                f"{node_ray_version}. Ray doesn't support clusters managed by "
+                "another Ray version. Install the node's Ray version locally, "
+                "or use a Docker image or setup commands that install this "
+                "Ray version on the nodes."
             )
 
     def rsync_up(self, source, target, docker_mount_if_possible=False):
