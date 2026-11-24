@@ -23,6 +23,7 @@ from ray.data.expressions import (
     Operation,
     PyArrowComputeUDFExpr,
     UnaryExpr,
+    _ARITHMETIC_OPERATIONS,
 )
 
 if TYPE_CHECKING:
@@ -195,27 +196,14 @@ def _is_safe_float_binary(expr: BinaryExpr) -> bool:
     )
 
 
-# Arithmetic operators whose result type PyArrow takes from the column.
-_ARITHMETIC_OPERATIONS = frozenset(
-    {
-        Operation.ADD,
-        Operation.SUB,
-        Operation.MUL,
-        Operation.DIV,
-        Operation.MOD,
-        Operation.FLOORDIV,
-    }
-)
-
-
 def has_column_arithmetic(expr: Expr) -> bool:
     """Whether ``expr`` does arithmetic on a column.
 
-    PyArrow evaluates a pushed filter's arithmetic in the column's type, so
-    int8 ``x + 100`` wraps to -56, while Ray's row filter widens it first.
+    Without a schema, PyArrow evaluates a pushed filter's arithmetic in the
+    column's type, so int8 ``x + 100`` wraps to -56, while Ray's row filter
+    widens it first. V2 file reads pass their schema to ``Expr.to_pyarrow()``;
+    V1 reads don't, so their arithmetic filters stay above the read.
     ``power`` is the only compute method that takes a second operand.
-
-    TODO: Remove once ``Expr.to_pyarrow()`` widens like Ray's row filter.
     """
     expr = expr._unalias()
     if isinstance(expr, BinaryExpr):

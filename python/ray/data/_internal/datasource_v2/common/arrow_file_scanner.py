@@ -11,7 +11,9 @@ from ray.data._internal.datasource_v2.common.file_pruners import (
 from ray.data._internal.datasource_v2.common.file_scanner import FileScanner
 from ray.data._internal.datasource_v2.common.pushdown_utils import (
     _split_predicate_by_columns,
+    combine_predicate_chain,
     combine_predicates,
+    flatten_predicate_chain,
 )
 from ray.data._internal.datasource_v2.interfaces.file_pruner import FilePruner
 from ray.data._internal.datasource_v2.interfaces.pushdown import (
@@ -19,7 +21,7 @@ from ray.data._internal.datasource_v2.interfaces.pushdown import (
     SupportsFilterPushdown,
     SupportsLimitPushdown,
 )
-from ray.data.expressions import Expr
+from ray.data.expressions import Expr, Operation
 from ray.util.annotations import DeveloperAPI
 
 
@@ -120,8 +122,8 @@ class ArrowFileScanner(
         Returns:
             A pair ``(scanner, residual)`` where ``scanner`` has accepted
             conjuncts merged into its PyArrow filter. ``residual`` contains
-            conjuncts requiring synthesized columns, or ``None`` if all
-            conjuncts were accepted.
+            conjuncts requiring synthesized columns or using arithmetic the
+            schema can't type, or ``None`` if all conjuncts were accepted.
         """
         split = _split_predicate_by_columns(predicate, self._synthesized_column_names())
         residual = combine_predicates(
@@ -130,7 +132,19 @@ class ArrowFileScanner(
         if split.data_predicate is None:
             return self, residual
 
-        combined = combine_predicates(self.predicate, split.data_predicate)
+        # The reader types arithmetic with this schema to compute Ray's answer.
+        typed: List[Expr] = []
+        for conjunct in flatten_predicate_chain(split.data_predicate, Operation.AND):
+            if conjunct._is_pyarrow_convertible(schema=self.schema):
+                typed.append(conjunct)
+            else:
+                residual = combine_predicates(residual, conjunct)
+        if not typed:
+            return self, residual
+
+        combined = combine_predicates(
+            self.predicate, combine_predicate_chain(typed, Operation.AND)
+        )
         return replace(self, predicate=combined), residual
 
     @override

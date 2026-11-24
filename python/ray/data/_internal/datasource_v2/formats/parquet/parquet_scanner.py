@@ -13,7 +13,6 @@ from ray.data._internal.datasource_v2.common.pushdown_utils import (
     combine_predicates,
     flatten_predicate_chain,
     float_column_names,
-    has_column_arithmetic,
     is_statistics_safe,
 )
 from ray.data._internal.datasource_v2.formats.parquet.parquet_file_reader import (
@@ -63,9 +62,7 @@ class ParquetScanner(ArrowFileScanner):
         unsafe: List[Expr] = []
         float_columns = float_column_names(self.schema)
         for conjunct in flatten_predicate_chain(predicate, Operation.AND):
-            if is_statistics_safe(
-                predicate=conjunct, float_columns=float_columns
-            ) and not has_column_arithmetic(expr=conjunct):
+            if is_statistics_safe(predicate=conjunct, float_columns=float_columns):
                 safe.append(conjunct)
             else:
                 unsafe.append(conjunct)
