@@ -488,6 +488,28 @@ def cleanup_security_groups(config):
         print(f"Error cleaning up security groups: {e}")
 
 
+RAYLET_LOGS_MARKER = "=== ray start failed; raylet logs on this worker ==="
+
+
+def print_raylet_logs_when_worker_start_fails(config_yaml: dict) -> None:
+    """Make a worker print its raylet logs when its `ray start` fails.
+
+    The autoscaler terminates a worker whose start commands fail, so its logs
+    are gone by the time the test fails. The output goes to the autoscaler
+    logs on the head, which the test prints.
+    """
+    logs = "/tmp/ray/session_latest/logs"
+    config_yaml["worker_start_ray_commands"] = [
+        (
+            f"{cmd} || {{ echo '{RAYLET_LOGS_MARKER}'; "
+            f"tail -n 60 {logs}/raylet.out {logs}/raylet.err; false; }}"
+        )
+        if "ray start" in cmd
+        else cmd
+        for cmd in config_yaml.get("worker_start_ray_commands", [])
+    ]
+
+
 def describe_aws_instances(config: dict) -> str:
     """Return the cluster's EC2 instances, including terminated ones.
 
@@ -541,15 +563,18 @@ def get_failure_logs(
         f"echo '--- Worker launches and failures:'; "
         f"grep -hiE 'Launched instance|Failed to launch|Attempt failed|capacity|"
         f"Terminating instance|Stopping instance|commands failed|update-failed' "
-        f"{logs}/monitor.log | tail -n 40; "
+        f"{logs}/monitor* | grep -v 'Full command is' | tail -n 40; "
+        f"echo '--- Raylet logs of workers whose ray start failed:'; "
+        f"grep -h -A 125 '^{RAYLET_LOGS_MARKER}' {logs}/monitor* | tail -n 250; "
         f"echo '--- Autoscaler errors:'; "
         f"grep -hiE 'error|exception|failed|denied|unauthorized|no space' "
         f"{logs}/monitor* | grep -v 'Full command is' | tail -n 30; "
         f"echo '--- Autoscaler status:'; tail -n 25 {logs}/monitor.log; "
         f"echo '--- GCS on the head:'; "
-        f"grep -hiE 'unauthenticated|auth|regist|error' {logs}/gcs_server.out "
-        f"| tail -n 30; "
-        f"for ip in $(ray get-worker-ips ~/ray_bootstrap_config.yaml); do "
+        f"grep -hiE 'Registering new node|unauthenticated|token|error' "
+        f"{logs}/gcs_server.out | grep -v 'Debug state' | tail -n 30; "
+        f"for ip in $(ray get-worker-ips ~/ray_bootstrap_config.yaml 2>/dev/null "
+        f"| grep -E '^[0-9]+([.][0-9]+){{3}}$'); do "
         f'echo "--- Raylet on worker $ip:"; '
         f"ssh -i ~/ray_bootstrap_key.pem -o StrictHostKeyChecking=no "
         f"-o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 {ssh_user}@$ip "
@@ -703,6 +728,8 @@ if __name__ == "__main__":
     if docker_override_image:
         override_docker_image(config_yaml, docker_override_image)
         add_registry_login(config_yaml, docker_override_image, files_dir.name)
+
+    print_raylet_logs_when_worker_start_fails(config_yaml)
 
     provider_type = config_yaml.get("provider", {}).get("type")
     config_yaml["provider"]["cache_stopped_nodes"] = False
