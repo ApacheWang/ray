@@ -488,20 +488,34 @@ def cleanup_security_groups(config):
         print(f"Error cleaning up security groups: {e}")
 
 
-def get_autoscaler_logs(cluster_config: Path, no_config_cache: bool, env: dict) -> str:
-    """Return the errors and the last lines of the autoscaler logs on the head.
+def get_failure_logs(
+    config_yaml: dict, cluster_config: Path, no_config_cache: bool, env: dict
+) -> str:
+    """Return the logs that show why a worker didn't join the cluster.
 
-    They include the setup output of the worker nodes, which the autoscaler
-    launches.
+    They are the autoscaler logs on the head, which include the setup output
+    of the workers, the head's GCS log, and the raylet logs of each worker.
     """
-    logs = "/tmp/ray/session_latest/logs/monitor*"
-    cmd = [
-        "ray",
-        "exec",
-        str(cluster_config),
-        f"grep -hiE 'error|fail|denied|unauthorized|no space' {logs} | tail -n 30; "
-        f"echo ...; tail -n 30 {logs}",
-    ]
+    logs = "/tmp/ray/session_latest/logs"
+    ssh_user = config_yaml["auth"]["ssh_user"]
+    container = config_yaml.get("docker", {}).get("container_name")
+    on_worker = f"docker exec {container} " if container else ""
+    script = (
+        f"echo '--- Autoscaler errors:'; "
+        f"grep -hiE 'error|exception|failed|denied|unauthorized|no space' "
+        f"{logs}/monitor* | grep -v 'Full command is' | tail -n 30; "
+        f"echo '--- Autoscaler status:'; tail -n 25 {logs}/monitor.log; "
+        f"echo '--- GCS on the head:'; "
+        f"grep -hiE 'unauthenticated|auth|regist|error' {logs}/gcs_server.out "
+        f"| tail -n 30; "
+        f"for ip in $(ray get-worker-ips ~/ray_bootstrap_config.yaml); do "
+        f'echo "--- Raylet on worker $ip:"; '
+        f"ssh -i ~/ray_bootstrap_key.pem -o StrictHostKeyChecking=no "
+        f"-o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 {ssh_user}@$ip "
+        f'"{on_worker}tail -n 40 {logs}/raylet.out {logs}/raylet.err"; '
+        f"done"
+    )
+    cmd = ["ray", "exec", str(cluster_config), script]
     if no_config_cache:
         cmd.append("--no-config-cache")
     result = subprocess.run(
@@ -582,13 +596,13 @@ def run_ray_commands(
             f"Error: Verification failed after {retries} attempts. Cleaning up cluster "
             "before exiting..."
         )
-        autoscaler_logs = get_autoscaler_logs(cluster_config, no_config_cache, env)
-        cleanup_cluster(config_yaml, cluster_config)
-        # Printed last, because the release test harness keeps only the end of
-        # the output.
+        # Printed before the cleanup, whose output is short: the release test
+        # harness keeps only the end of the output, and can miss the last lines.
         print("======================================")
-        print("Autoscaler logs on the head node, which show how workers were set up:")
-        print(autoscaler_logs)
+        print("Logs that show why workers didn't join:")
+        print(get_failure_logs(config_yaml, cluster_config, no_config_cache, env))
+        print("======================================")
+        cleanup_cluster(config_yaml, cluster_config)
         print("======================================")
         print("Exiting script.")
         sys.exit(1)
