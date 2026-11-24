@@ -488,6 +488,43 @@ def cleanup_security_groups(config):
         print(f"Error cleaning up security groups: {e}")
 
 
+def describe_aws_instances(config: dict) -> str:
+    """Return the cluster's EC2 instances, including terminated ones.
+
+    The state reason of a terminated worker tells whether AWS reclaimed a spot
+    instance, which the autoscaler doesn't log.
+    """
+    if config.get("provider", {}).get("type") != "aws":
+        return ""
+    try:
+        ec2_client = boto3.client("ec2", region_name=config["provider"]["region"])
+        response = ec2_client.describe_instances(
+            Filters=[
+                {"Name": "tag:ray-cluster-name", "Values": [config["cluster_name"]]}
+            ]
+        )
+    except Exception as e:
+        return f"Couldn't describe the cluster's instances: {e}"
+    lines = []
+    for reservation in response["Reservations"]:
+        for instance in reservation["Instances"]:
+            tags = {t["Key"]: t["Value"] for t in instance.get("Tags", [])}
+            lines.append(
+                " ".join(
+                    [
+                        instance["LaunchTime"].isoformat(),
+                        instance["InstanceId"],
+                        tags.get("ray-node-type", "?"),
+                        instance.get("InstanceLifecycle", "on-demand"),
+                        instance["State"]["Name"],
+                        tags.get("ray-node-status", "?"),
+                        instance.get("StateReason", {}).get("Message", ""),
+                    ]
+                )
+            )
+    return "\n".join(sorted(lines))
+
+
 def get_failure_logs(
     config_yaml: dict, cluster_config: Path, no_config_cache: bool, env: dict
 ) -> str:
@@ -501,6 +538,10 @@ def get_failure_logs(
     container = config_yaml.get("docker", {}).get("container_name")
     on_worker = f"docker exec {container} " if container else ""
     script = (
+        f"echo '--- Worker launches and failures:'; "
+        f"grep -hiE 'Launched instance|Failed to launch|Attempt failed|capacity|"
+        f"Terminating instance|Stopping instance|commands failed|update-failed' "
+        f"{logs}/monitor.log | tail -n 40; "
         f"echo '--- Autoscaler errors:'; "
         f"grep -hiE 'error|exception|failed|denied|unauthorized|no space' "
         f"{logs}/monitor* | grep -v 'Full command is' | tail -n 30; "
@@ -601,6 +642,9 @@ def run_ray_commands(
         print("======================================")
         print("Logs that show why workers didn't join:")
         print(get_failure_logs(config_yaml, cluster_config, no_config_cache, env))
+        print("--- The cluster's instances (launch time, id, node type, lifecycle, ")
+        print("state, Ray node status, state reason):")
+        print(describe_aws_instances(config_yaml))
         print("======================================")
         cleanup_cluster(config_yaml, cluster_config)
         print("======================================")
